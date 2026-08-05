@@ -47,7 +47,10 @@ dependencies = [
     "bids-validator-deno >= 2.0.5",
     "click >= 8.2",
     "click-didyoumean >= 0.3.1",
-    "dandischema >= 0.12.0, < 0.14.0",
+    # TEMP: pull dandischema from the release-schema branch (dandi-schema#342)
+    # so CI exercises the downgrade path; revert to `dandischema >= 0.12.0, < 0.14.0`
+    # once that PR is released.
+    "dandischema @ git+https://github.com/dandi/dandi-schema@release-schema",
     "etelemetry >= 0.2.2",
     "fasteners >= 0.19",
     "fscacher >= 0.3.0",
