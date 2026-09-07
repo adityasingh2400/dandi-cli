@@ -42,11 +42,17 @@ DOI_RESOLVER_URL = "https://doi.org/"
 #: Content type requested from the DOI resolver for citation metadata
 DOI_CSL_ACCEPT = "application/vnd.citationstyles.csl+json; charset=utf-8"
 
-#: Matches a bare DOI, e.g. ``10.48324/dandi.001827/0.260505.1322``
-DOI_REGEX = re.compile(r"10\.\d{4,9}/\S+")
+#: Matches a bare DOI, e.g. ``10.48324/dandi.001827/0.260505.1322``.
+#: The prefix may be subdivided by a registrant (``10.1000.10/123``), which the
+#: DOI Handbook allows, so the leading number is followed by zero or more
+#: ``.``-separated groups.
+DOI_REGEX = re.compile(r"10\.\d{4,9}(?:\.\d+)*/\S+")
 
-#: Prefixes a DOI may be spelled with, in the order they are stripped
+#: Prefixes a DOI may be spelled with, in the order they are stripped.  The
+#: second is a resolver URL, and only that spelling may carry a query string or
+#: fragment that is part of the URL rather than of the DOI.
 DOI_PREFIX_REGEXES = (r"doi:", r"(?:https?://)?(?:dx\.)?doi\.org/")
+DOI_URL_PREFIX_REGEX = DOI_PREFIX_REGEXES[1]
 
 
 def normalize_doi(doi: str) -> str:
@@ -75,6 +81,13 @@ def normalize_doi(doi: str) -> str:
     for prefix_regex in DOI_PREFIX_REGEXES:
         if m := re.match(prefix_regex, value, flags=re.I):
             value = value[m.end() :].strip()
+            if prefix_regex is DOI_URL_PREFIX_REGEX:
+                # A resolver URL copied from a browser can carry a query string
+                # or fragment (``...?locatt=mode:legacy``).  Those belong to the
+                # URL, not to the DOI, and keeping them would store a corrupted
+                # identifier in the Dandiset metadata.  Bare DOIs are left alone,
+                # since ``?`` and ``#`` are legal (if rare) DOI characters.
+                value = re.split(r"[?#]", value, maxsplit=1)[0]
             break
     if not DOI_REGEX.fullmatch(value):
         raise ValueError(
@@ -112,10 +125,24 @@ def fetch_doi_citation_metadata(doi: str) -> dict[str, Any]:
     ) as doiclient:
         try:
             r = doiclient.get(doi, json_resp=False)
-        except HTTP404Error:
+        except HTTP404Error as e:
+            # doi.org 302-redirects a registered DOI to its registration
+            # agency's content-negotiation endpoint, which can itself 404 when
+            # the record is not served as CSL.  Only a 404 that came back from
+            # doi.org itself means the DOI is unregistered.
+            final_url = e.response.url if e.response is not None else url
+            final_netloc = urllib.parse.urlparse(str(final_url)).netloc
+            if final_netloc == urllib.parse.urlparse(DOI_RESOLVER_URL).netloc:
+                raise click.ClickException(
+                    f"DOI {doi} is not registered: {url} returned 404.  Check "
+                    "the DOI for typos and make sure it has already been "
+                    "published."
+                )
             raise click.ClickException(
-                f"DOI {doi} is not registered: {url} returned 404.  Check the "
-                "DOI for typos and make sure it has already been published."
+                f"DOI {doi} is registered but no citation metadata is available "
+                f"for it: {url} redirected to {final_url}, which returned 404.  "
+                "The registration agency may not serve CSL JSON for this record, "
+                "or the metadata may not have propagated yet."
             )
         except HTTPError as e:
             status = e.response.status_code if e.response is not None else "?"
@@ -141,6 +168,47 @@ def fetch_doi_citation_metadata(doi: str) -> dict[str, Any]:
             f"the expected CSL JSON object (final URL: {r.url})."
         )
     return doidata
+
+
+#: CSL JSON keys this command indexes directly, by the field that needs them
+DOI_REQUIRED_KEYS = {"contributor": "author", "relatedResource": "title"}
+
+
+def check_doi_fields(doi: str, doidata: dict[str, Any], fields: set[str]) -> None:
+    """Fail early if `doidata` lacks a key the requested `fields` will index.
+
+    `fetch_doi_citation_metadata()` only guarantees a CSL JSON object.  Some
+    real records (editorials, corrections, records with only organizational
+    creators) omit ``author`` or ``title``, which would otherwise surface as a
+    bare `KeyError` traceback part-way through building the new metadata.
+
+    Parameters
+    ----------
+    doi : str
+        The bare DOI, used in the error message
+    doidata : dict
+        The CSL JSON record
+    fields : set[str]
+        The Dandiset metadata fields the user asked to update
+
+    Raises
+    ------
+    click.ClickException
+        If a requested field needs a CSL key the record does not have
+    """
+    missing = {
+        key: field
+        for field, key in DOI_REQUIRED_KEYS.items()
+        if field in fields and key not in doidata
+    }
+    if missing:
+        details = ", ".join(
+            f"{key!r} (needed for {field})" for key, field in sorted(missing.items())
+        )
+        raise click.ClickException(
+            f"DOI {doi} resolved to citation metadata without {details}.  Re-run "
+            "with --fields limited to the fields its record can supply."
+        )
 
 
 @click.group()
@@ -376,6 +444,7 @@ def update_dandiset_from_doi(
     # Resolve the DOI before talking to the archive, so that a bad DOI fails
     # fast and without requiring credentials
     doidata = fetch_doi_citation_metadata(doi)
+    check_doi_fields(doi, doidata, fields)
     with DandiAPIClient.for_dandi_instance(dandi_instance, authenticate=True) as client:
         d = client.get_dandiset(dandiset, "draft", lazy=False)
         original_metadata = d.get_raw_metadata()

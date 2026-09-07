@@ -19,6 +19,7 @@ from dandi.tests.fixtures import SampleDandiset
 
 from ..cmd_service_scripts import (
     DOI_CSL_ACCEPT,
+    check_doi_fields,
     fetch_doi_citation_metadata,
     normalize_doi,
     service_scripts,
@@ -183,6 +184,90 @@ def test_normalize_doi(given: str) -> None:
 def test_normalize_doi_rejects_non_doi(given: str) -> None:
     with pytest.raises(ValueError, match="does not look like a DOI"):
         normalize_doi(given)
+
+
+@pytest.mark.ai_generated
+@pytest.mark.parametrize(
+    "given,expected",
+    [
+        # The DOI Handbook allows the registrant to subdivide the prefix.
+        ("10.1000.10/123", "10.1000.10/123"),
+        ("https://doi.org/10.1000.10/123", "10.1000.10/123"),
+        ("10.1000.10.5/123", "10.1000.10.5/123"),
+        # A resolver URL copied from a browser can carry a query string or
+        # fragment.  Those belong to the URL, not to the DOI.
+        ("https://doi.org/10.1234/foo?locatt=mode:legacy", "10.1234/foo"),
+        ("https://doi.org/10.1234/foo#section", "10.1234/foo"),
+        ("http://dx.doi.org/10.1234/foo?x=1#y", "10.1234/foo"),
+        # A bare or doi:-prefixed DOI keeps them, since they are legal in a DOI.
+        ("10.1234/foo?bar", "10.1234/foo?bar"),
+        ("doi:10.1234/foo#bar", "10.1234/foo#bar"),
+    ],
+)
+def test_normalize_doi_prefix_and_url_suffix(given: str, expected: str) -> None:
+    assert normalize_doi(given) == expected
+
+
+@pytest.mark.ai_generated
+@pytest.mark.parametrize(
+    "fields,record,missing",
+    [
+        ({"contributor"}, {"title": "T"}, "author"),
+        ({"relatedResource"}, {"author": []}, "title"),
+        ({"contributor", "relatedResource"}, {}, "author"),
+    ],
+)
+def test_check_doi_fields_missing(
+    fields: set[str], record: dict, missing: str
+) -> None:
+    with pytest.raises(click.ClickException, match=re.escape(repr(missing))):
+        check_doi_fields("10.1234/foo", record, fields)
+
+
+@pytest.mark.ai_generated
+@pytest.mark.parametrize(
+    "fields,record",
+    [
+        # Only the requested fields are required.
+        ({"name"}, {}),
+        ({"description"}, {}),
+        ({"contributor"}, {"author": []}),
+        ({"contributor", "relatedResource"}, {"author": [], "title": "T"}),
+    ],
+)
+def test_check_doi_fields_ok(fields: set[str], record: dict) -> None:
+    check_doi_fields("10.1234/foo", record, fields)
+
+
+@pytest.mark.ai_generated
+@responses.activate
+def test_fetch_doi_citation_metadata_404_from_agency() -> None:
+    # doi.org 302s a registered DOI to its registration agency, which can 404
+    # even though the DOI exists.  That must not be reported as unregistered.
+    doi = "10.1234/registered-but-no-csl"
+    responses.add(
+        responses.GET,
+        f"https://doi.org/{doi}",
+        status=302,
+        headers={"Location": "https://data.crossref.org/nope"},
+    )
+    responses.add(responses.GET, "https://data.crossref.org/nope", status=404)
+    with pytest.raises(click.ClickException) as excinfo:
+        fetch_doi_citation_metadata(doi)
+    msg = str(excinfo.value)
+    assert "is registered but no citation metadata" in msg
+    assert "data.crossref.org" in msg
+    assert "not registered" not in msg
+
+
+@pytest.mark.ai_generated
+@responses.activate
+def test_fetch_doi_citation_metadata_404_from_resolver() -> None:
+    # A 404 straight from doi.org does mean the DOI is not registered.
+    doi = "10.1234/does-not-exist"
+    responses.add(responses.GET, f"https://doi.org/{doi}", status=404)
+    with pytest.raises(click.ClickException, match="is not registered"):
+        fetch_doi_citation_metadata(doi)
 
 
 @pytest.mark.ai_generated
