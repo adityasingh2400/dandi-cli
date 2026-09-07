@@ -256,7 +256,9 @@ def test_fetch_doi_citation_metadata_404_from_agency() -> None:
         fetch_doi_citation_metadata(doi)
     msg = str(excinfo.value)
     assert "is registered but no citation metadata" in msg
-    assert "data.crossref.org" in msg
+    # assert the whole redirect target, not a bare hostname substring, which
+    # CodeQL flags as incomplete URL sanitization
+    assert "https://data.crossref.org/nope" in msg
     assert "not registered" not in msg
 
 
